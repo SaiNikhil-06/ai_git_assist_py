@@ -298,23 +298,77 @@ def append_changelog(readme_path: Path, commit_message: str) -> None:
 # Slack
 # -----------------------------
 
-def send_slack_notification(commit_message: str) -> None:
+def send_slack_notification(text: str) -> None:
     webhook = os.environ.get("SLACK_WEBHOOK_URL", "").strip()
     if not webhook:
+        print("⚠️  SLACK_WEBHOOK_URL not set; skipping Slack.", file=sys.stderr)
         return
 
-    # Avoid hard dependency unless needed.
     try:
         import requests  # type: ignore
-
-        requests.post(webhook, json={"text": "AI Commit:\n" + commit_message}, timeout=10)
+        requests.post(webhook, json={"text": text}, timeout=10)
     except Exception as e:
         print(f"Failed to send Slack notification: {e}", file=sys.stderr)
+
+def build_repo_context(repo: Path, max_files: int = 200, max_total_chars: int = 40000) -> str:
+    """
+    Build a compact repo snapshot for the LLM:
+    - file list from git (respects ignore)
+    - excerpts of key files (small and high-signal)
+    """
+    cp = run_git(repo, "ls-files", check=False)
+    files = [f.strip() for f in (cp.stdout or "").splitlines() if f.strip()]
+    files = files[:max_files]
+
+    key_names = {
+        "pyproject.toml", "setup.py", "setup.cfg", "requirements.txt",
+        "Pipfile", "poetry.lock", "environment.yml",
+        "package.json", "Makefile", "Dockerfile",
+        "README.md",
+    }
+
+    # prioritize: key files + top-level python/js + notebooks
+    prioritized = []
+    for f in files:
+        p = Path(f)
+        if p.name in key_names:
+            prioritized.append(f)
+    for f in files:
+        if f in prioritized:
+            continue
+        if f.endswith((".py", ".js", ".ts", ".ipynb")) and ("/.venv/" not in f) and ("/venv/" not in f):
+            prioritized.append(f)
+
+    chunks = []
+    chunks.append("REPO FILES:\n" + "\n".join(files))
+
+    budget = max_total_chars - len(chunks[0])
+    for f in prioritized:
+        if budget <= 1000:
+            break
+        path = repo / f
+        if not path.exists() or path.is_dir():
+            continue
+        try:
+            raw = path.read_text(encoding="utf-8", errors="ignore")
+        except Exception:
+            continue
+
+        # Don’t dump huge notebooks; just take the head.
+        snippet = raw[:6000]
+        block = f"\n\n===== {f} (excerpt) =====\n{snippet}"
+        if len(block) > budget:
+            continue
+        chunks.append(block)
+        budget -= len(block)
+
+    return "\n".join(chunks)
 
 
 # -----------------------------
 # OpenAI integration
 # -----------------------------
+
 
 class AIClient:
     def __init__(self, model: str):
@@ -401,27 +455,72 @@ class AIClient:
             temperature=0.2,
         )
 
-    def update_readme(self, current_readme: str, commit_message: str, diff: str) -> str:
+
+    def update_readme(self, repo_context: str, current_readme: str, commit_message: str, diff: str) -> str:
         prompt = (
-            "Here is the current README.md:\n\n"
+            "You are updating a GitHub README.md.\n"
+            "You MUST make it accurate to what the repository actually does.\n\n"
+            "Repo context (file list + excerpts):\n"
+            f"{repo_context}\n\n"
+            "Current README.md:\n"
             f"{current_readme}\n\n"
-            "Here is the new commit message:\n"
+            "New commit message:\n"
             f"{commit_message}\n\n"
-            "Here is the git diff:\n"
+            "Git diff summary:\n"
             f"{diff}\n\n"
-            "Update the README.md to reflect the new changes.\n"
-            "- Add new features to the Features section if relevant.\n"
-            "- Update Usage or Configuration if needed.\n"
-            "- Do NOT remove existing information.\n"
-            "- Keep all original sections.\n"
-            "- Do NOT wrap the file in code fences.\n"
+            "Instructions:\n"
+            "- Rewrite/improve the README so it matches the repo’s real purpose and files.\n"
+            "- Fix/remove obviously nonsense bullets (keep useful history).\n"
+            "- Keep existing section headers if present, but improve content.\n"
+            "- Ensure Features are real and specific (based on repo context).\n"
+            "- Usage should include the commands a user would actually run.\n"
+            "- Configuration should mention env vars only if the repo truly uses them.\n"
+            "- Do NOT wrap in code fences.\n"
             "Return the full updated README.md."
         )
         return self._call(
-            instructions="You update README.md files professionally for software projects.",
+            instructions="You write accurate, practical READMEs based on the repository contents.",
             prompt=prompt,
             temperature=0.2,
         )
+
+
+    def generate_slack_update(
+        self,
+        repo_name: str,
+        branch: str,
+        commit_sha: str,
+        commit_message: str,
+        staged_files: List[str],
+        diff_summary: str,
+        ) -> str:
+        files = "\n".join([f"- {f}" for f in staged_files]) if staged_files else "- (none)"
+        prompt = (
+            "Write a Slack update for a complete repo change.\n"
+            "Goal: human, useful, and specific. Not generic.\n\n"
+            f"Repo: {repo_name}\n"
+            f"Branch: {branch}\n"
+            f"Commit: {commit_sha}\n\n"
+            "Commit message:\n"
+            f"{commit_message}\n\n"
+            "Files changed:\n"
+            f"{files}\n\n"
+            "Diff summary:\n"
+            f"{diff_summary}\n\n"
+            "Slack message rules:\n"
+            "- 6 to 12 lines max\n"
+            "- Start with a 1-line headline with an emoji\n"
+            "- Then 3-6 bullets: what changed + why it matters\n"
+            "- Add 1 line: 'Impact/Risk:' with honest risk level\n"
+            "- Add 1 line: 'Next:' with a sensible follow-up\n"
+            "- No code fences, no backticks\n"
+        )
+        return self._call(
+            instructions="You write concise, practical Slack engineering updates.",
+            prompt=prompt,
+            temperature=0.2,
+        )
+
 
 
 # -----------------------------
@@ -471,17 +570,22 @@ def edit_commit_message(original: str) -> str:
 def ensure_readme(repo: Path, commit_message: str, diff: str, ai: AIClient) -> None:
     readme_path = repo / README_FILE
     project_name = repo.name
-    env_keys = ["OPENAI_API_KEY", "SLACK_WEBHOOK_URL", "OPENAI_MODEL"]
+
+    # Build repo context so README updates match what the repo actually contains
+    repo_context = build_repo_context(repo)
 
     if not readme_path.exists():
-        content = ai.generate_readme(project_name, env_keys)
+        # Only include env vars in README if you really want them documented.
+        # For most repos (like CampusRecruitmentML), env_keys can be empty.
+        content = ai.generate_readme(project_name, env_keys=[])
         readme_path.write_text(content.strip() + "\n", encoding="utf-8")
     else:
         current = readme_path.read_text(encoding="utf-8")
-        content = ai.update_readme(current, commit_message, diff)
-        readme_path.write_text(content.strip() + "\n", encoding="utf-8")
+        updated = ai.update_readme(repo_context, current, commit_message, diff)
+        readme_path.write_text(updated.strip() + "\n", encoding="utf-8")
 
     append_changelog(readme_path, commit_message)
+
 
 
 # -----------------------------
@@ -741,6 +845,28 @@ def main(argv: Optional[List[str]] = None) -> int:
         if e.stdout and not stderr:
             print((e.stdout or "").strip() + "\n", file=sys.stderr)
         return 1
+
+    if args.slack:
+        try:
+            sha = run_git(repo, "rev-parse", "--short", "HEAD").stdout.strip()
+            branch = current_branch(repo)
+
+            files_in_commit = run_git(repo, "show", "--name-only", "--pretty=", "HEAD").stdout.splitlines()
+            files_in_commit = [f.strip() for f in files_in_commit if f.strip()]
+
+            slack_text = ai.generate_slack_update(
+                repo_name=repo.name,
+                branch=branch,
+                commit_sha=sha,
+                commit_message=commit_message,
+                staged_files=files_in_commit,
+                diff_summary=diff_for_ai[:8000],
+            )
+            send_slack_notification(slack_text)
+            print("✅ Slack notification sent.\n")
+        except Exception as e:
+            print(f"⚠️  Slack notify failed: {e}", file=sys.stderr)
+
 
     if args.no_push:
         print("Skipping push (--no-push).\n")
